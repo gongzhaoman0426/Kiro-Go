@@ -842,6 +842,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartIamSso(w, r)
 	case path == "/auth/iam-sso/complete" && r.Method == "POST":
 		h.apiCompleteIamSso(w, r)
+	case path == "/auth/builderid/start" && r.Method == "POST":
+		h.apiStartBuilderIdLogin(w, r)
+	case path == "/auth/builderid/poll" && r.Method == "POST":
+		h.apiPollBuilderIdAuth(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -1072,6 +1076,98 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Region string `json:"region"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	session, err := auth.StartBuilderIdLogin(req.Region)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":       session.ID,
+		"userCode":        session.UserCode,
+		"verificationUri": session.VerificationUri,
+		"interval":        session.Interval,
+	})
+}
+
+func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, status, err := auth.PollBuilderIdAuth(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if status == "pending" || status == "slow_down" {
+		// 获取当前间隔
+		interval := 5
+		if session := auth.GetBuilderIdSession(req.SessionID); session != nil {
+			interval = session.Interval
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    status,
+			"interval":  interval,
+		})
+		return
+	}
+
+	// 授权完成，获取用户信息
+	email, _, _ := auth.GetUserInfo(accessToken)
+
+	// 创建账号
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        email,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		AuthMethod:   "idc",
+		Provider:     "BuilderId",
+		Region:       region,
+		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
+}
+
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BearerToken string `json:"bearerToken"`
@@ -1089,44 +1185,67 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, clientID, clientSecret, expiresIn, err := auth.ImportFromSsoToken(req.BearerToken, req.Region)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
+	// 支持批量导入，按行分割
+	tokens := strings.Split(strings.TrimSpace(req.BearerToken), "\n")
+	var imported []map[string]interface{}
+	var errors []string
 
-	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
 
-	// 创建账号
-	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		AuthMethod:   "idc",
-		Region:       req.Region,
-		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-	}
+		accessToken, refreshToken, clientID, clientSecret, expiresIn, err := auth.ImportFromSsoToken(token, req.Region)
+		if err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
 
-	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
+		// 获取用户信息
+		email, _, _ := auth.GetUserInfo(accessToken)
+
+		// 创建账号
+		account := config.Account{
+			ID:           auth.GenerateAccountID(),
+			Email:        email,
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			AuthMethod:   "idc",
+			Region:       req.Region,
+			ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+			Enabled:      true,
+			MachineId:    config.GenerateMachineId(),
+		}
+
+		if err := config.AddAccount(account); err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+
+		imported = append(imported, map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		})
 	}
 
 	h.pool.Reload()
+
+	if len(imported) == 0 && len(errors) > 0 {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   strings.Join(errors, "; "),
+		})
+		return
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"account": map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
-		},
+		"success":  true,
+		"accounts": imported,
+		"errors":   errors,
 	})
 }
 
