@@ -57,7 +57,7 @@ func NewHandler() *Handler {
 
 // backgroundRefresh 后台定时刷新账户信息
 func (h *Handler) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
+	ticker := time.NewTicker(10 * time.Minute) // 每 10 分钟刷新一次
 	defer ticker.Stop()
 
 	// 启动时延迟 10 秒后执行一次
@@ -85,8 +85,8 @@ func (h *Handler) refreshAllAccounts() {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-300 {
+		// 检查 token 是否需要刷新（提前 10 分钟刷新）
+		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-600 {
 			newAccessToken, newRefreshToken, newExpiresAt, err := auth.RefreshToken(account)
 			if err != nil {
 				fmt.Printf("[BackgroundRefresh] Token refresh failed for %s: %v\n", account.Email, err)
@@ -1279,13 +1279,25 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-300 {
+	// ExpiresAt > 0 且未过期，token 仍然有效
+	if account.ExpiresAt > 0 && time.Now().Unix() < account.ExpiresAt-300 {
 		return nil
 	}
 
+	// token 已过期或 ExpiresAt 未设置，尝试刷新
+	if account.RefreshToken == "" {
+		// 没有 refresh token，无法刷新；ExpiresAt=0 时假设 token 有效
+		if account.ExpiresAt == 0 {
+			return nil
+		}
+		return fmt.Errorf("token expired and no refresh token available")
+	}
+
+	fmt.Printf("[EnsureValidToken] Refreshing token for %s (ExpiresAt=%d)\n", account.Email, account.ExpiresAt)
+
 	accessToken, refreshToken, expiresAt, err := auth.RefreshToken(account)
 	if err != nil {
-		return err
+		return fmt.Errorf("token refresh failed: %w", err)
 	}
 
 	// 更新内存
@@ -1299,6 +1311,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	// 持久化
 	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
 
+	fmt.Printf("[EnsureValidToken] Token refreshed for %s, new ExpiresAt=%d\n", account.Email, expiresAt)
 	return nil
 }
 
@@ -1991,12 +2004,11 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return nil
 	}
 
-	// 检查 token 是否快过期，先刷新
-	if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-300 {
+	// 手动刷新时，无论 token 是否过期都强制刷新
+	if account.RefreshToken != "" {
 		if err := refreshTokenIfNeeded(); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
+			fmt.Printf("[ManualRefresh] Token refresh failed for %s: %v\n", account.Email, err)
+			// 不直接返回，继续尝试用现有 token 获取账户信息
 		}
 	}
 

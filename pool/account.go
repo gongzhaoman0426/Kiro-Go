@@ -55,6 +55,8 @@ func (p *AccountPool) GetNext() *config.Account {
 	n := len(p.accounts)
 
 	// 轮询查找可用账号
+	// 优先选择 token 未过期的，其次选择 token 过期但有 RefreshToken 的
+	var expiredCandidate *config.Account
 	for i := 0; i < n; i++ {
 		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
 		acc := &p.accounts[idx]
@@ -64,12 +66,20 @@ func (p *AccountPool) GetNext() *config.Account {
 			continue
 		}
 
-		// 跳过即将过期的 Token
+		// Token 即将过期的账号先记下来，不直接跳过
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
+			if expiredCandidate == nil && acc.RefreshToken != "" {
+				expiredCandidate = acc
+			}
 			continue
 		}
 
 		return acc
+	}
+
+	// 没有未过期的账号，但有可刷新的过期账号，返回它让 ensureValidToken 去刷新
+	if expiredCandidate != nil {
+		return expiredCandidate
 	}
 
 	// 无可用账号，返回冷却时间最短的
